@@ -11,64 +11,50 @@ app.use(cors());
 let sock;
 let qrCodeData = '';
 let isConnected = false;
-let allMessages = []; // 🆕 Array para guardar TODAS as mensagens
-let contacts = new Map(); // 🆕 Map para guardar info dos contatos
+let allMessages = []; // ✅ Guardar TODAS as mensagens
+let contacts = new Map();
 
-// URLs dos webhooks
-const NOTION_WEBHOOK = process.env.NOTION_WEBHOOK || '';
-const N8N_WEBHOOK = process.env.N8N_WEBHOOK || '';
-
-// Keep-alive
+// Keep-alive para Render
 function keepAlive() {
   if (process.env.RENDER_SERVICE_URL) {
     setInterval(() => {
-      fetch(process.env.RENDER_SERVICE_URL + '/health')
-        .catch(() => {});
+      fetch(process.env.RENDER_SERVICE_URL + '/health').catch(() => {});
     }, 14 * 60 * 1000);
   }
 }
 
-// Função para salvar mensagem
+// ✅ Função melhorada para salvar TODAS as mensagens
 function saveMessage(messageData) {
-  // Adicionar à lista de todas as mensagens
+  // Verificar se já existe (evitar duplicatas)
+  const exists = allMessages.some(msg => msg.id === messageData.id);
+  if (exists) return;
+
   allMessages.push({
     ...messageData,
     savedAt: new Date().toISOString()
   });
 
-  // Manter apenas as últimas 500 mensagens para não sobrecarregar
-  if (allMessages.length > 500) {
-    allMessages = allMessages.slice(-500);
+  // Manter últimas 1000 mensagens
+  if (allMessages.length > 1000) {
+    allMessages = allMessages.slice(-1000);
   }
 
-  // Atualizar info do contato
-  contacts.set(messageData.fromNumber, {
-    name: messageData.pushName || 'Sem nome',
-    phone: messageData.fromNumber,
-    lastMessage: messageData.text,
-    lastSeen: messageData.timestamp,
-    messageCount: (contacts.get(messageData.fromNumber)?.messageCount || 0) + 1
-  });
-
-  console.log(`💾 Mensagem salva - Total: ${allMessages.length} | Contatos: ${contacts.size}`);
-}
-
-// Função para enviar para webhooks
-async function sendToWebhooks(messageData) {
-  const webhooks = [NOTION_WEBHOOK, N8N_WEBHOOK].filter(url => url);
-  
-  for (const webhookUrl of webhooks) {
-    try {
-      await fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(messageData)
-      });
-      console.log(`📤 Enviado para webhook: ${webhookUrl.substring(0, 50)}...`);
-    } catch (error) {
-      console.log(`❌ Erro no webhook: ${error.message}`);
-    }
+  // Atualizar contato
+  if (messageData.fromNumber) {
+    const existingContact = contacts.get(messageData.fromNumber) || {};
+    contacts.set(messageData.fromNumber, {
+      ...existingContact,
+      name: messageData.pushName || existingContact.name || 'Sem nome',
+      phone: messageData.fromNumber,
+      lastMessage: messageData.text,
+      lastSeen: messageData.timestamp,
+      messageCount: (existingContact.messageCount || 0) + 1
+    });
   }
+
+  const direction = messageData.fromMe ? '📤 Enviada' : '📥 Recebida';
+  console.log(`💾 ${direction} - ${messageData.pushName || 'Você'}: ${messageData.text?.substring(0, 50)}...`);
+  console.log(`📊 Total: ${allMessages.length} msgs | ${contacts.size} contatos`);
 }
 
 // Conectar ao WhatsApp
@@ -80,7 +66,8 @@ async function connectToWhatsApp() {
       auth: state,
       printQRInTerminal: false,
       browser: ['CRM System', 'Chrome', '1.0.0'],
-      syncFullHistory: true // 🆕 Tentar sincronizar histórico
+      syncFullHistory: false,
+      generateHighQualityLinkPreview: true
     });
 
     sock.ev.on('creds.update', saveCreds);
@@ -106,126 +93,151 @@ async function connectToWhatsApp() {
         }
         isConnected = false;
       } else if (connection === 'open') {
-        console.log('✅ WhatsApp conectado! Buscando conversas...');
+        console.log('✅ WhatsApp conectado! Sistema de captura ativo.');
         isConnected = true;
         qrCodeData = '';
         
-        // 🆕 Tentar carregar conversas existentes
-        await loadExistingChats();
+        // Carregar conversas existentes
+        setTimeout(loadExistingChats, 3000);
       }
     });
 
-    // 🆕 Escutar mensagens (recebidas e enviadas)
+    // ✅ CAPTURAR TODAS AS MENSAGENS (RECEBIDAS + ENVIADAS)
     sock.ev.on('messages.upsert', async (m) => {
       try {
         for (const message of m.messages) {
+          
+          // ✅ Extrair dados da mensagem (funciona para enviadas e recebidas)
           const messageData = {
             id: message.key.id,
             from: message.key.remoteJid,
             fromNumber: message.key.remoteJid?.split('@')[0],
-            text: message.message?.conversation || 
-                  message.message?.extendedTextMessage?.text || 
-                  '[Mídia]',
+            text: extractMessageText(message),
             timestamp: new Date().toISOString(),
-            pushName: message.pushName || 'Sem nome',
-            fromMe: message.key.fromMe || false,
-            messageTimestamp: message.messageTimestamp
+            pushName: message.pushName || (message.key.fromMe ? 'Você' : 'Sem nome'),
+            fromMe: Boolean(message.key.fromMe), // ✅ Crucial: identificar se é sua mensagem
+            messageTimestamp: message.messageTimestamp,
+            type: getMessageType(message)
           };
 
-          // Salvar todas as mensagens (recebidas e enviadas)
-          if (messageData.fromNumber) {
+          // ✅ Salvar TODAS as mensagens válidas
+          if (messageData.fromNumber && messageData.fromNumber.length >= 10) {
             saveMessage(messageData);
             
-            // Enviar para webhooks apenas se não for minha mensagem
-            if (!messageData.fromMe) {
-              console.log('📨 Nova mensagem recebida:', {
-                de: messageData.pushName,
-                numero: messageData.fromNumber,
-                texto: messageData.text
-              });
-              
-              await sendToWebhooks(messageData);
+            // Log diferenciado
+            if (messageData.fromMe) {
+              console.log(`📤 VOCÊ → ${messageData.fromNumber}: ${messageData.text}`);
+            } else {
+              console.log(`📥 ${messageData.pushName} → VOCÊ: ${messageData.text}`);
             }
           }
         }
       } catch (error) {
-        console.error('Erro ao processar mensagens:', error);
+        console.error('❌ Erro ao processar mensagens:', error);
       }
     });
 
-    // 🆕 Escutar atualizações de contatos
-    sock.ev.on('contacts.update', (contacts) => {
-      for (const contact of contacts) {
-        if (contact.id && contact.name) {
-          const phone = contact.id.split('@')[0];
-          contacts.set(phone, {
-            ...contacts.get(phone),
-            name: contact.name,
-            phone: phone
-          });
-        }
+    // ✅ Capturar mensagens enviadas via API também
+    sock.ev.on('message-receipt.update', (updates) => {
+      for (const update of updates) {
+        console.log('📧 Recibo de mensagem:', update);
       }
     });
 
   } catch (error) {
-    console.error('Erro na conexão:', error);
+    console.error('❌ Erro na conexão:', error);
     setTimeout(connectToWhatsApp, 5000);
   }
 }
 
-// 🆕 Função para carregar conversas existentes
+// ✅ Função para extrair texto de diferentes tipos de mensagem
+function extractMessageText(message) {
+  if (message.message?.conversation) {
+    return message.message.conversation;
+  }
+  if (message.message?.extendedTextMessage?.text) {
+    return message.message.extendedTextMessage.text;
+  }
+  if (message.message?.imageMessage?.caption) {
+    return `[Imagem] ${message.message.imageMessage.caption}`;
+  }
+  if (message.message?.videoMessage?.caption) {
+    return `[Vídeo] ${message.message.videoMessage.caption}`;
+  }
+  if (message.message?.audioMessage) {
+    return '[Áudio]';
+  }
+  if (message.message?.documentMessage) {
+    return `[Documento] ${message.message.documentMessage.fileName || ''}`;
+  }
+  if (message.message?.stickerMessage) {
+    return '[Sticker]';
+  }
+  return '[Mídia]';
+}
+
+// ✅ Função para identificar tipo de mensagem
+function getMessageType(message) {
+  if (message.message?.conversation || message.message?.extendedTextMessage) return 'text';
+  if (message.message?.imageMessage) return 'image';
+  if (message.message?.videoMessage) return 'video';
+  if (message.message?.audioMessage) return 'audio';
+  if (message.message?.documentMessage) return 'document';
+  if (message.message?.stickerMessage) return 'sticker';
+  return 'unknown';
+}
+
+// ✅ Carregar conversas existentes
 async function loadExistingChats() {
   if (!sock) return;
   
   try {
     console.log('📚 Carregando conversas existentes...');
     
-    // Buscar todas as conversas
     const chats = await sock.getChats();
     console.log(`💬 ${chats.length} conversas encontradas`);
     
-    let loadedMessages = 0;
+    let loadedCount = 0;
     
-    for (const chat of chats.slice(0, 20)) { // Limitar a 20 conversas mais recentes
-      if (chat.id.endsWith('@s.whatsapp.net')) { // Apenas conversas individuais
+    // Limitar para não sobrecarregar
+    for (const chat of chats.slice(0, 15)) {
+      if (chat.id.endsWith('@s.whatsapp.net')) {
         try {
           // Buscar mensagens da conversa
-          const messages = await sock.fetchMessagesFromWA(chat.id, 10); // Últimas 10 mensagens
+          const messages = await sock.fetchMessagesFromWA(chat.id, 5);
           
           for (const msg of messages) {
             const messageData = {
-              id: msg.key.id,
+              id: msg.key.id + '_historic',
               from: msg.key.remoteJid,
               fromNumber: msg.key.remoteJid?.split('@')[0],
-              text: msg.message?.conversation || 
-                    msg.message?.extendedTextMessage?.text || 
-                    '[Mídia]',
+              text: extractMessageText(msg),
               timestamp: new Date(msg.messageTimestamp * 1000).toISOString(),
               pushName: msg.pushName || chat.name || 'Sem nome',
-              fromMe: msg.key.fromMe || false,
+              fromMe: Boolean(msg.key.fromMe),
               messageTimestamp: msg.messageTimestamp,
-              isHistoric: true // 🆕 Marcar como histórica
+              isHistoric: true
             };
 
             if (messageData.fromNumber) {
               saveMessage(messageData);
-              loadedMessages++;
+              loadedCount++;
             }
           }
           
-          // Pequena pausa entre conversas
+          // Pausa entre conversas
           await new Promise(resolve => setTimeout(resolve, 500));
           
         } catch (error) {
-          console.log(`⚠️ Erro ao carregar conversa ${chat.id}:`, error.message);
+          console.log(`⚠️ Erro ao carregar conversa: ${error.message}`);
         }
       }
     }
     
-    console.log(`✅ ${loadedMessages} mensagens históricas carregadas!`);
+    console.log(`✅ ${loadedCount} mensagens históricas carregadas!`);
     
   } catch (error) {
-    console.error('Erro ao carregar conversas:', error);
+    console.error('❌ Erro ao carregar conversas:', error);
   }
 }
 
@@ -237,25 +249,30 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     totalMessages: allMessages.length,
-    totalContacts: contacts.size
+    totalContacts: contacts.size,
+    connected: isConnected
   });
 });
 
 app.get('/', (req, res) => {
+  const sentMessages = allMessages.filter(msg => msg.fromMe).length;
+  const receivedMessages = allMessages.filter(msg => !msg.fromMe).length;
+  
   res.json({
-    message: '🚀 API WhatsApp CRM (v2.0)',
+    message: '🚀 WhatsApp CRM API v2.1 - Captura Completa',
     connected: isConnected,
     stats: {
       totalMessages: allMessages.length,
+      sentByMe: sentMessages,
+      received: receivedMessages,
       totalContacts: contacts.size,
-      uptime: process.uptime()
+      uptime: Math.round(process.uptime())
     },
     endpoints: {
       '/qr': 'QR Code para conectar',
-      '/status': 'Status da conexão',
+      '/status': 'Status detalhado',
       '/messages': 'Todas as mensagens',
-      '/conversations': '🆕 Conversas agrupadas',
-      '/contacts': '🆕 Lista de contatos',
+      '/conversations': 'Conversas agrupadas',
       '/send-message': 'Enviar mensagem'
     }
   });
@@ -265,40 +282,42 @@ app.get('/qr', (req, res) => {
   if (qrCodeData) {
     res.send(`
       <html>
-        <head>
-          <title>QR Code WhatsApp CRM</title>
-          <style>
-            body { font-family: Arial; text-align: center; padding: 20px; background: #f5f5f5; }
-            .container { background: white; padding: 30px; border-radius: 10px; max-width: 500px; margin: 0 auto; }
-            img { max-width: 300px; border: 1px solid #ddd; }
-            .refresh { margin: 20px; }
-            button { background: #25D366; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; }
-          </style>
+        <head><title>WhatsApp CRM - QR Code</title>
+        <style>body{font-family:Arial;text-align:center;padding:20px;background:#f5f5f5}
+        .container{background:white;padding:30px;border-radius:10px;max-width:500px;margin:0 auto}
+        img{max-width:300px;border:1px solid #ddd}
+        button{background:#25D366;color:white;border:none;padding:10px 20px;border-radius:5px;cursor:pointer}</style>
         </head>
         <body>
           <div class="container">
-            <h1>📱 Conectar WhatsApp ao CRM</h1>
+            <h1>📱 Conectar WhatsApp</h1>
             <p>Escaneie com seu WhatsApp:</p>
             <img src="${qrCodeData}" alt="QR Code">
-            <div class="refresh">
+            <div style="margin:20px">
               <button onclick="window.location.reload()">🔄 Atualizar</button>
             </div>
-            <p><small>Após conectar, suas conversas serão sincronizadas automaticamente</small></p>
+            <p><small>Versão 2.1 - Captura mensagens enviadas + recebidas</small></p>
           </div>
         </body>
       </html>
     `);
   } else if (isConnected) {
+    const sentMessages = allMessages.filter(msg => msg.fromMe).length;
+    const receivedMessages = allMessages.filter(msg => !msg.fromMe).length;
+    
     res.send(`
       <html>
-        <body style="font-family: Arial; text-align: center; padding: 50px; background: #f5f5f5;">
-          <div style="background: white; padding: 30px; border-radius: 10px; max-width: 500px; margin: 0 auto;">
+        <body style="font-family:Arial;text-align:center;padding:50px;background:#f5f5f5">
+          <div style="background:white;padding:30px;border-radius:10px;max-width:600px;margin:0 auto">
             <h1>✅ WhatsApp Conectado!</h1>
-            <p>📊 ${allMessages.length} mensagens sincronizadas</p>
-            <p>👥 ${contacts.size} contatos encontrados</p>
-            <div style="margin: 20px;">
-              <a href="/messages" style="margin: 10px; padding: 10px 20px; background: #25D366; color: white; text-decoration: none; border-radius: 5px;">📱 Ver Mensagens</a>
-              <a href="/conversations" style="margin: 10px; padding: 10px 20px; background: #1f8ef1; color: white; text-decoration: none; border-radius: 5px;">💬 Ver Conversas</a>
+            <div style="display:flex;justify-content:space-around;margin:20px">
+              <div><h3>📤 ${sentMessages}</h3><p>Enviadas</p></div>
+              <div><h3>📥 ${receivedMessages}</h3><p>Recebidas</p></div>
+              <div><h3>👥 ${contacts.size}</h3><p>Contatos</p></div>
+            </div>
+            <div style="margin:20px">
+              <a href="/messages?format=html" style="margin:10px;padding:10px 20px;background:#25D366;color:white;text-decoration:none;border-radius:5px">📱 Ver Mensagens</a>
+              <a href="/conversations" style="margin:10px;padding:10px 20px;background:#1f8ef1;color:white;text-decoration:none;border-radius:5px">💬 Conversas</a>
             </div>
           </div>
         </body>
@@ -307,7 +326,7 @@ app.get('/qr', (req, res) => {
   } else {
     res.send(`
       <html>
-        <body style="font-family: Arial; text-align: center; padding: 50px;">
+        <body style="font-family:Arial;text-align:center;padding:50px">
           <h1>⏳ Conectando...</h1>
           <p>Aguarde alguns segundos...</p>
           <button onclick="window.location.reload()">🔄 Atualizar</button>
@@ -317,44 +336,70 @@ app.get('/qr', (req, res) => {
   }
 });
 
-// 🆕 Endpoint melhorado para mensagens
+app.get('/status', (req, res) => {
+  const sentMessages = allMessages.filter(msg => msg.fromMe);
+  const receivedMessages = allMessages.filter(msg => !msg.fromMe);
+  
+  res.json({
+    connected: isConnected,
+    hasQR: !!qrCodeData,
+    totalMessages: allMessages.length,
+    sentByMe: sentMessages.length,
+    received: receivedMessages.length,
+    totalContacts: contacts.size,
+    uptime: process.uptime(),
+    lastMessages: allMessages.slice(-5).map(msg => ({
+      from: msg.fromMe ? 'Você' : msg.pushName,
+      text: msg.text?.substring(0, 50) + '...',
+      timestamp: msg.timestamp,
+      fromMe: msg.fromMe
+    }))
+  });
+});
+
+// ✅ Endpoint melhorado de mensagens
 app.get('/messages', (req, res) => {
   const limit = parseInt(req.query.limit) || 50;
   const phone = req.query.phone;
   const format = req.query.format || 'json';
+  const onlyFromMe = req.query.fromMe === 'true';
+  const onlyReceived = req.query.received === 'true';
   
-  let filteredMessages = allMessages;
+  let filteredMessages = [...allMessages];
   
-  // Filtrar por telefone se especificado
+  // Filtros
   if (phone) {
-    filteredMessages = allMessages.filter(msg => msg.fromNumber === phone);
+    filteredMessages = filteredMessages.filter(msg => msg.fromNumber === phone);
+  }
+  if (onlyFromMe) {
+    filteredMessages = filteredMessages.filter(msg => msg.fromMe);
+  }
+  if (onlyReceived) {
+    filteredMessages = filteredMessages.filter(msg => !msg.fromMe);
   }
   
-  // Ordenar por timestamp (mais recentes primeiro)
+  // Ordenar (mais recentes primeiro)
   filteredMessages.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-  
   const result = filteredMessages.slice(0, limit);
   
   if (format === 'html') {
-    // Formato HTML para visualização
     let html = `
       <html>
-        <head>
-          <title>Mensagens WhatsApp</title>
-          <style>
-            body { font-family: Arial; padding: 20px; background: #f5f5f5; }
-            .message { background: white; padding: 15px; margin: 10px 0; border-radius: 8px; border-left: 4px solid #25D366; }
-            .from-me { border-left-color: #1f8ef1; background: #f0f8ff; }
-            .historic { border-left-color: #ffa500; }
-          </style>
+        <head><title>Mensagens WhatsApp CRM</title>
+        <style>body{font-family:Arial;padding:20px;background:#f5f5f5}
+        .message{background:white;padding:15px;margin:10px 0;border-radius:8px;border-left:4px solid #25D366}
+        .from-me{border-left-color:#1f8ef1;background:#f0f8ff}
+        .historic{border-left-color:#ffa500}</style>
         </head>
         <body>
-          <h1>📱 Mensagens WhatsApp (${result.length})</h1>
+          <h1>📱 Mensagens WhatsApp CRM (${result.length})</h1>
+          <p>📤 ${allMessages.filter(m => m.fromMe).length} enviadas | 
+             📥 ${allMessages.filter(m => !m.fromMe).length} recebidas</p>
     `;
     
     for (const msg of result) {
       const cssClass = msg.fromMe ? 'from-me' : (msg.isHistoric ? 'historic' : '');
-      const direction = msg.fromMe ? '👤 Você' : `📞 ${msg.pushName}`;
+      const direction = msg.fromMe ? '📤 Você' : `📥 ${msg.pushName}`;
       const time = new Date(msg.timestamp).toLocaleString('pt-BR');
       
       html += `
@@ -369,21 +414,23 @@ app.get('/messages', (req, res) => {
     html += '</body></html>';
     res.send(html);
   } else {
-    // Formato JSON
     res.json({
       messages: result,
-      total: allMessages.length,
-      filtered: filteredMessages.length,
-      contacts: contacts.size
+      stats: {
+        total: allMessages.length,
+        filtered: filteredMessages.length,
+        sentByMe: allMessages.filter(msg => msg.fromMe).length,
+        received: allMessages.filter(msg => !msg.fromMe).length,
+        contacts: contacts.size
+      }
     });
   }
 });
 
-// 🆕 Endpoint para conversas agrupadas
+// ✅ Conversas agrupadas
 app.get('/conversations', (req, res) => {
   const conversations = {};
   
-  // Agrupar mensagens por telefone
   for (const msg of allMessages) {
     if (!conversations[msg.fromNumber]) {
       conversations[msg.fromNumber] = {
@@ -393,14 +440,22 @@ app.get('/conversations', (req, res) => {
         },
         messages: [],
         lastMessage: '',
-        lastTimestamp: ''
+        lastTimestamp: '',
+        sentCount: 0,
+        receivedCount: 0
       };
     }
     
     conversations[msg.fromNumber].messages.push(msg);
+    
+    if (msg.fromMe) {
+      conversations[msg.fromNumber].sentCount++;
+    } else {
+      conversations[msg.fromNumber].receivedCount++;
+    }
   }
   
-  // Ordenar mensagens dentro de cada conversa e pegar última
+  // Processar cada conversa
   for (const phone in conversations) {
     const conv = conversations[phone];
     conv.messages.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
@@ -409,6 +464,7 @@ app.get('/conversations', (req, res) => {
     if (lastMsg) {
       conv.lastMessage = lastMsg.text;
       conv.lastTimestamp = lastMsg.timestamp;
+      conv.lastFromMe = lastMsg.fromMe;
     }
   }
   
@@ -419,55 +475,48 @@ app.get('/conversations', (req, res) => {
   });
 });
 
-// 🆕 Endpoint para contatos
-app.get('/contacts', (req, res) => {
-  const contactsList = Array.from(contacts.values());
-  res.json({
-    contacts: contactsList,
-    total: contactsList.length
-  });
-});
-
-// Endpoint para enviar mensagem
+// ✅ Enviar mensagem (com captura garantida)
 app.post('/send-message', async (req, res) => {
   try {
     const { number, message } = req.body;
     
     if (!number || !message) {
-      return res.status(400).json({ 
-        error: 'Número e mensagem são obrigatórios' 
-      });
+      return res.status(400).json({ error: 'Número e mensagem obrigatórios' });
     }
     
     if (!isConnected) {
-      return res.status(400).json({ 
-        error: 'WhatsApp não conectado' 
-      });
+      return res.status(400).json({ error: 'WhatsApp não conectado' });
     }
     
     const jid = number.includes('@') ? number : `${number}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
     
-    // Salvar mensagem enviada
+    // Enviar mensagem
+    const result = await sock.sendMessage(jid, { text: message });
+    
+    // ✅ Garantir que a mensagem enviada seja salva
     const messageData = {
-      id: Date.now().toString(),
+      id: result.key.id,
       from: jid,
-      fromNumber: number,
+      fromNumber: number.replace(/\D/g, ''),
       text: message,
       timestamp: new Date().toISOString(),
       pushName: 'Você',
-      fromMe: true
+      fromMe: true,
+      type: 'text'
     };
     
+    // Salvar imediatamente
     saveMessage(messageData);
     
     res.json({ 
       success: true, 
-      message: 'Mensagem enviada!',
+      message: 'Mensagem enviada e salva!',
+      messageId: result.key.id,
       timestamp: new Date().toISOString()
     });
     
   } catch (error) {
+    console.error('❌ Erro ao enviar:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -475,14 +524,15 @@ app.post('/send-message', async (req, res) => {
 // Iniciar servidor
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 WhatsApp CRM API v2.0 - Porta ${PORT}`);
+  console.log(`🚀 WhatsApp CRM API v2.1 - Porta ${PORT}`);
+  console.log(`🎯 Captura COMPLETA: Mensagens enviadas + recebidas`);
   console.log(`📱 Acesse /qr para conectar`);
   
   connectToWhatsApp();
   keepAlive();
 });
 
-// Keep-alive job
-cron.schedule('*/5 * * * *', () => {
-  console.log(`⏰ Sistema ativo - ${allMessages.length} mensagens, ${contacts.size} contatos`);
+// Job de limpeza
+cron.schedule('0 */6 * * *', () => {
+  console.log(`🧹 Limpeza: ${allMessages.length} mensagens, ${contacts.size} contatos`);
 });
